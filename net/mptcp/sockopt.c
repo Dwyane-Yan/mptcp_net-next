@@ -598,6 +598,10 @@ static int mptcp_setsockopt_sol_tcp_congestion(struct mptcp_sock *msk, sockptr_t
 	bool cap_net_admin;
 	int ret;
 
+	/* lock_sock(ssk) below would sleep; forbidden in BPF (rcu) context. */
+	if (has_current_bpf_ctx())
+		return -EOPNOTSUPP;
+
 	if (optlen < 1)
 		return -EINVAL;
 
@@ -611,7 +615,7 @@ static int mptcp_setsockopt_sol_tcp_congestion(struct mptcp_sock *msk, sockptr_t
 	cap_net_admin = ns_capable(sock_net(sk)->user_ns, CAP_NET_ADMIN);
 
 	ret = 0;
-	lock_sock(sk);
+	sockopt_lock_sock(sk);
 	sockopt_seq_inc(msk);
 	mptcp_for_each_subflow(msk, subflow) {
 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
@@ -628,7 +632,7 @@ static int mptcp_setsockopt_sol_tcp_congestion(struct mptcp_sock *msk, sockptr_t
 	if (ret == 0)
 		strscpy(msk->ca_name, name, sizeof(msk->ca_name));
 
-	release_sock(sk);
+	sockopt_release_sock(sk);
 	return ret;
 }
 
@@ -638,6 +642,10 @@ static int __mptcp_setsockopt_set_val(struct mptcp_sock *msk, int max,
 {
 	struct mptcp_subflow_context *subflow;
 	int err = 0;
+
+	/* lock_sock(ssk) below would sleep; forbidden in BPF (rcu) context. */
+	if (has_current_bpf_ctx())
+		return -EOPNOTSUPP;
 
 	mptcp_for_each_subflow(msk, subflow) {
 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
@@ -662,6 +670,10 @@ static int __mptcp_setsockopt_sol_tcp_cork(struct mptcp_sock *msk, int val)
 	struct mptcp_subflow_context *subflow;
 	struct sock *sk = (struct sock *)msk;
 
+	/* lock_sock(ssk) below would sleep; forbidden in BPF (rcu) context. */
+	if (has_current_bpf_ctx())
+		return -EOPNOTSUPP;
+
 	sockopt_seq_inc(msk);
 	msk->cork = !!val;
 	mptcp_for_each_subflow(msk, subflow) {
@@ -681,6 +693,10 @@ static int __mptcp_setsockopt_sol_tcp_nodelay(struct mptcp_sock *msk, int val)
 {
 	struct mptcp_subflow_context *subflow;
 	struct sock *sk = (struct sock *)msk;
+
+	/* lock_sock(ssk) below would sleep; forbidden in BPF (rcu) context. */
+	if (has_current_bpf_ctx())
+		return -EOPNOTSUPP;
 
 	sockopt_seq_inc(msk);
 	msk->nodelay = !!val;
@@ -793,8 +809,14 @@ static int mptcp_setsockopt_first_sf_only(struct mptcp_sock *msk, int level, int
 	struct sock *ssk;
 	int ret;
 
+	/* tcp_setsockopt(ssk) below would need the subflow lock; forbidden in
+	 * BPF (rcu) context.
+	 */
+	if (has_current_bpf_ctx())
+		return -EOPNOTSUPP;
+
 	/* Limit to first subflow, before the connection establishment */
-	lock_sock(sk);
+	sockopt_lock_sock(sk);
 	ssk = __mptcp_nmpc_sk(msk);
 	if (IS_ERR(ssk)) {
 		ret = PTR_ERR(ssk);
@@ -804,7 +826,7 @@ static int mptcp_setsockopt_first_sf_only(struct mptcp_sock *msk, int level, int
 	ret = tcp_setsockopt(ssk, level, optname, optval, optlen);
 
 unlock:
-	release_sock(sk);
+	sockopt_release_sock(sk);
 	return ret;
 }
 
@@ -814,6 +836,12 @@ static int mptcp_setsockopt_all_sf(struct mptcp_sock *msk, int level,
 {
 	struct mptcp_subflow_context *subflow;
 	int ret = 0;
+
+	/* tcp_setsockopt(ssk) below would need the subflow lock; forbidden in
+	 * BPF (rcu) context.
+	 */
+	if (has_current_bpf_ctx())
+		return -EOPNOTSUPP;
 
 	mptcp_for_each_subflow(msk, subflow) {
 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
@@ -857,7 +885,7 @@ static int mptcp_setsockopt_sol_tcp(struct mptcp_sock *msk, int optname,
 	if (ret)
 		return ret;
 
-	lock_sock(sk);
+	sockopt_lock_sock(sk);
 	switch (optname) {
 	case TCP_INQ:
 		if (val < 0 || val > 1)
@@ -900,7 +928,7 @@ static int mptcp_setsockopt_sol_tcp(struct mptcp_sock *msk, int optname,
 		ret = -ENOPROTOOPT;
 	}
 
-	release_sock(sk);
+	sockopt_release_sock(sk);
 	return ret;
 }
 

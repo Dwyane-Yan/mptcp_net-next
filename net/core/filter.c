@@ -5683,6 +5683,17 @@ static int __bpf_setsockopt(struct sock *sk, int level, int optname,
 	if (!sk_fullsock(sk))
 		return -EINVAL;
 
+	/* mptcp master sockets are not plain TCP: sk_is_tcp() is false and
+	 * the per-level sol_*_sockopt() helpers would reject them or bypass
+	 * mptcp's own dispatch. Route any bpf_setsockopt() on an msk to
+	 * mptcp_setsockopt(), which handles all levels and the fallback
+	 * subflow. BPF callers already hold the master socket lock, and
+	 * mptcp_setsockopt_sol_tcp() uses sockopt_lock_sock() accordingly.
+	 */
+	if (IS_ENABLED(CONFIG_MPTCP) && sk_is_mptcp(sk))
+		return mptcp_setsockopt(sk, level, optname,
+					KERNEL_SOCKPTR(optval), optlen);
+
 	if (level == SOL_SOCKET)
 		return sol_socket_sockopt(sk, optname, optval, &optlen, false);
 	else if (IS_ENABLED(CONFIG_INET) && level == SOL_IP)
