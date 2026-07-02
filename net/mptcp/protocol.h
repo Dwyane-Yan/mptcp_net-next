@@ -829,6 +829,45 @@ void mptcp_cancel_work(struct sock *sk);
 void __mptcp_unaccepted_force_close(struct sock *sk);
 void mptcp_set_state(struct sock *sk, int state);
 
+#ifdef CONFIG_BPF
+/* Invoke a cgroup BPF sock_ops program on the msk.
+ *
+ * Unlike tcp_call_bpf(), this does NOT set is_locked_tcp_sock and does
+ * NOT assert sock_owned_by_me(): mptcp_set_state() can be reached from
+ * contexts holding only the subflow (ssk) lock, not the msk socket lock
+ * (e.g. subflow close/error paths). BPF programs invoked from here
+ * therefore cannot use lock-requiring helpers such as bpf_setsockopt;
+ * they can only observe the reported state transition.
+ */
+static inline int mptcp_call_bpf_2arg(struct sock *sk, int op, u32 arg1,
+				      u32 arg2)
+{
+	struct bpf_sock_ops_kern sock_ops;
+	u32 args[2] = { arg1, arg2 };
+	int ret;
+
+	memset(&sock_ops, 0, offsetof(struct bpf_sock_ops_kern, temp));
+	if (sk_fullsock(sk))
+		sock_ops.is_fullsock = 1;
+	sock_ops.sk = sk;
+	sock_ops.op = op;
+	memcpy(sock_ops.args, args, sizeof(args));
+
+	ret = BPF_CGROUP_RUN_PROG_SOCK_OPS(&sock_ops);
+	if (ret == 0)
+		ret = sock_ops.reply;
+	else
+		ret = -1;
+	return ret;
+}
+#else
+static inline int mptcp_call_bpf_2arg(struct sock *sk, int op, u32 arg1,
+				      u32 arg2)
+{
+	return -1;
+}
+#endif
+
 bool mptcp_addresses_equal(const struct mptcp_addr_info *a,
 			   const struct mptcp_addr_info *b, bool use_port);
 void mptcp_local_address(const struct sock_common *skc,

@@ -3309,6 +3309,8 @@ void mptcp_set_state(struct sock *sk, int state)
 	}
 
 	inet_sk_state_store(sk, state);
+
+	mptcp_call_bpf_2arg(sk, BPF_SOCK_OPS_STATE_CB, oldstate, state);
 }
 
 static const unsigned char new_state[16] = {
