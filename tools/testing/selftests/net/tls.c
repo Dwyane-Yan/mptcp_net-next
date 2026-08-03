@@ -634,25 +634,25 @@ static void chunked_sendfile(struct __test_metadata *_metadata,
 
 TEST_F(tls, multi_chunk_sendfile)
 {
-	//chunked_sendfile(_metadata, self, 4096, 4096);
-	//chunked_sendfile(_metadata, self, 4096, 0);
-	//chunked_sendfile(_metadata, self, 4096, 1);
-	//chunked_sendfile(_metadata, self, 4096, 2048);
-	//chunked_sendfile(_metadata, self, 8192, 2048);
-	//chunked_sendfile(_metadata, self, 4096, 8192);
-	//chunked_sendfile(_metadata, self, 8192, 4096);
-	//chunked_sendfile(_metadata, self, 12288, 1024);
-	//chunked_sendfile(_metadata, self, 12288, 2000);
-	//chunked_sendfile(_metadata, self, 15360, 100);
-	//chunked_sendfile(_metadata, self, 15360, 300);
+	chunked_sendfile(_metadata, self, 4096, 4096);
+	chunked_sendfile(_metadata, self, 4096, 0);
+	chunked_sendfile(_metadata, self, 4096, 1);
+	chunked_sendfile(_metadata, self, 4096, 2048);
+	chunked_sendfile(_metadata, self, 8192, 2048);
+	chunked_sendfile(_metadata, self, 4096, 8192);
+	chunked_sendfile(_metadata, self, 8192, 4096);
+	chunked_sendfile(_metadata, self, 12288, 1024);
+	chunked_sendfile(_metadata, self, 12288, 2000);
+	chunked_sendfile(_metadata, self, 15360, 100);
+	chunked_sendfile(_metadata, self, 15360, 300);
 	chunked_sendfile(_metadata, self, 1, 4096);
-	//chunked_sendfile(_metadata, self, 2048, 4096);
-	//chunked_sendfile(_metadata, self, 2048, 8192);
-	//chunked_sendfile(_metadata, self, 4096, 8192);
-	//chunked_sendfile(_metadata, self, 1024, 12288);
-	//chunked_sendfile(_metadata, self, 2000, 12288);
-	//chunked_sendfile(_metadata, self, 100, 15360);
-	//chunked_sendfile(_metadata, self, 300, 15360);
+	chunked_sendfile(_metadata, self, 2048, 4096);
+	chunked_sendfile(_metadata, self, 2048, 8192);
+	chunked_sendfile(_metadata, self, 4096, 8192);
+	chunked_sendfile(_metadata, self, 1024, 12288);
+	chunked_sendfile(_metadata, self, 2000, 12288);
+	chunked_sendfile(_metadata, self, 100, 15360);
+	chunked_sendfile(_metadata, self, 300, 15360);
 }
 
 TEST_F(tls, recv_max)
