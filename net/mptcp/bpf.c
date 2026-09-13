@@ -13,6 +13,7 @@
 #include <linux/bpf_verifier.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
+#include <linux/skmsg.h>
 #include <net/bpf_sk_storage.h>
 #include "protocol.h"
 
@@ -355,3 +356,22 @@ static int __init bpf_mptcp_kfunc_init(void)
 	return ret;
 }
 late_initcall(bpf_mptcp_kfunc_init);
+
+void mptcp_eat_skb(struct sock *sk, struct sk_buff *skb)
+{
+	struct mptcp_sock *msk;
+	u32 len;
+
+	if (!skb || !skb->len || !msk_is_mptcp(sk))
+		return;
+
+	if (skb_bpf_strparser(skb))
+		return;
+
+	msk = mptcp_sk(sk);
+	len = skb->len - MPTCP_SKB_CB(skb)->offset;
+	WRITE_ONCE(msk->bytes_consumed, msk->bytes_consumed + len);
+	msk->read_copied += len;
+	set_bit(MPTCP_WORK_READ_COMPLETE, &msk->flags);
+	mptcp_schedule_work(sk);
+}
