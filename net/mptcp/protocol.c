@@ -2210,7 +2210,7 @@ do_error:
 	goto out;
 }
 
-static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 {
 	int ret;
 
@@ -2461,8 +2461,7 @@ static unsigned int mptcp_inq_hint(struct sock *sk)
 	return (unsigned int)hint_val;
 }
 
-static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
-			 int flags)
+int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
 	struct scm_timestamping_internal tss;
@@ -3877,6 +3876,8 @@ struct sock *mptcp_sk_clone_init(const struct sock *sk,
 	mptcp_reclassify_socket(nsk);
 
 	bh_lock_sock(nsk);
+	mptcp_bpf_clone(sk, nsk);
+
 #if IS_ENABLED(CONFIG_MPTCP_IPV6)
 	if (nsk->sk_family == AF_INET6)
 		inet_sk(nsk)->pinet6 = mptcp_inet6_sk(nsk);
@@ -4391,7 +4392,7 @@ out:
 	return 0;
 }
 
-static struct proto mptcp_prot = {
+struct proto mptcp_prot = {
 	.name		= "MPTCP",
 	.owner		= THIS_MODULE,
 	.init		= mptcp_init_sock,
@@ -4422,6 +4423,9 @@ static struct proto mptcp_prot = {
 	.obj_size	= sizeof(struct mptcp_sock),
 	.slab_flags	= SLAB_TYPESAFE_BY_RCU,
 	.no_autobind	= true,
+#ifdef CONFIG_BPF_SYSCALL
+	.psock_update_sk_prot	= mptcp_bpf_update_proto,
+#endif
 };
 
 static int mptcp_bind(struct socket *sock, struct sockaddr_unsized *uaddr, int addr_len)
