@@ -4790,6 +4790,12 @@ static int mptcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 	return __mptcp_read_sock(sk, desc, recv_actor, false);
 }
 
+int mptcp_read_sock_noack(struct sock *sk, read_descriptor_t *desc,
+			  sk_read_actor_t recv_actor)
+{
+	return __mptcp_read_sock(sk, desc, recv_actor, true);
+}
+
 static void mptcp_read_done(struct sock *sk, size_t len)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);

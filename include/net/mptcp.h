@@ -16,6 +16,7 @@ struct mptcp_info;
 struct mptcp_sock;
 struct mptcp_pm_addr_entry;
 struct seq_file;
+struct strparser;
 
 /* MPTCP sk_buff extension data */
 struct mptcp_ext {
@@ -249,6 +250,9 @@ static inline __be32 mptcp_reset_option(const struct sk_buff *skb)
 void mptcp_active_detect_blackhole(struct sock *sk, bool expired);
 
 void mptcp_eat_skb(struct sock *sk, struct sk_buff *skb);
+
+int mptcp_bpf_strp_read_sock(struct strparser *strp, read_descriptor_t *desc,
+			     sk_read_actor_t recv_actor);
 #else
 
 static inline void mptcp_init(void)
@@ -339,6 +343,12 @@ static inline __be32 mptcp_reset_option(const struct sk_buff *skb)  { return hto
 static inline void mptcp_active_detect_blackhole(struct sock *sk, bool expired) { }
 
 static inline void mptcp_eat_skb(struct sock *sk, struct sk_buff *skb) { }
+
+static inline int mptcp_bpf_strp_read_sock(struct strparser *strp, read_descriptor_t *desc,
+					   sk_read_actor_t recv_actor)
+{
+	return 0;
+}
 #endif /* CONFIG_MPTCP */
 
 #if IS_ENABLED(CONFIG_MPTCP_IPV6)
