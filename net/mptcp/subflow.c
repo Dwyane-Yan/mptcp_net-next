@@ -518,8 +518,6 @@ static void subflow_set_remote_key(struct mptcp_sock *msk,
 				   struct mptcp_subflow_context *subflow,
 				   const struct mptcp_options_received *mp_opt)
 {
-	struct sock *sk = (struct sock *)msk;
-
 	/* active MPC subflow will reach here multiple times:
 	 * at subflow_finish_connect() time and at 4th ack time
 	 */
@@ -538,14 +536,7 @@ static void subflow_set_remote_key(struct mptcp_sock *msk,
 	WRITE_ONCE(msk->ack_seq, subflow->iasn);
 	WRITE_ONCE(msk->can_ack, true);
 	atomic64_set(&msk->rcv_wnd_sent, subflow->iasn);
-	msk->tfo_iasn = subflow->iasn;
-
-	if (!sock_owned_by_user(sk)) {
-		msk->copied_seq += subflow->iasn;
-		__mptcp_sync_rcv_sequence(sk);
-	} else {
-		set_bit(MPTCP_SYNC_SEQ, &msk->cb_flags);
-	}
+	msk->copied_seq += subflow->iasn;
 }
 
 static void mptcp_propagate_state(struct sock *sk, struct sock *ssk,
@@ -562,13 +553,6 @@ static void mptcp_propagate_state(struct sock *sk, struct sock *ssk,
 		WRITE_ONCE(msk->snd_una, subflow->idsn + 1);
 		WRITE_ONCE(msk->wnd_end, subflow->idsn + 1 + tcp_sk(ssk)->snd_wnd);
 		subflow_set_remote_key(msk, subflow, mp_opt);
-	} else {
-		/* Fallback (no MPTCP options at SYN-ACK) */
-		subflow->map_seq = 0;
-		subflow->map_subflow_seq = tcp_sk(ssk)->copied_seq -
-					   subflow->ssn_offset;
-		WRITE_ONCE(msk->ack_seq, 0);
-		msk->copied_seq = 0;
 	}
 
 	if (!sock_owned_by_user(sk)) {

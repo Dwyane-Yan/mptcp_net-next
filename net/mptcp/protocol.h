@@ -128,14 +128,14 @@
 #define MPTCP_FLUSH_JOIN_LIST	5
 #define MPTCP_SYNC_STATE	6
 #define MPTCP_SYNC_SNDBUF	7
-#define MPTCP_SYNC_SEQ		8
 
 struct mptcp_skb_cb {
 	u32 map_seq;
 	u32 end_seq;
-	u32 unused;
+	u32 offset;
 	u16 flags;
 	u8  has_rxtstamp;
+	u8  cant_coalesce;
 	u64 map_seq64;
 };
 
@@ -338,7 +338,6 @@ struct mptcp_sock {
 	int		read_copied;
 	unsigned long	timer_ival;
 	u32		token;
-	u64		tfo_iasn;
 	unsigned long	flags;
 	unsigned long	cb_flags;
 	bool		recovery;		/* closing subflow write queue reinjected */
@@ -350,7 +349,6 @@ struct mptcp_sock {
 	bool		use_64bit_ack; /* Set when we received a 64-bit DSN */
 	bool		csum_enabled;
 	bool		allow_infinite_fallback;
-	bool		rcvd_dummy_seq;
 	bool		dsn64; /* Outgoing DSS DSN length, from sysctl */
 	u8		pending_state; /* A subflow asked to set this sk_state,
 					* protected by the msk data lock
@@ -1211,7 +1209,6 @@ void mptcp_event_pm_listener(const struct sock *ssk,
 			     enum mptcp_event_type event);
 bool mptcp_userspace_pm_active(const struct mptcp_sock *msk);
 
-void __mptcp_sync_rcv_sequence(struct sock *sk);
 void mptcp_fastopen_subflow_synack_set_params(struct mptcp_subflow_context *subflow,
 					      struct request_sock *req);
 int mptcp_pm_genl_fill_addr(struct sk_buff *msg,

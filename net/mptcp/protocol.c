@@ -183,9 +183,8 @@ static bool __mptcp_try_coalesce(struct sock *sk, struct sk_buff *to,
 {
 	int limit = READ_ONCE(sk->sk_rcvbuf);
 
-	if (MPTCP_SKB_CB(from)->map_seq != MPTCP_SKB_CB(to)->end_seq ||
-	    MPTCP_SKB_CB(from)->map_seq64 != MPTCP_SKB_CB(to)->map_seq64 +
-					     to->len ||
+	if (unlikely(MPTCP_SKB_CB(to)->cant_coalesce) ||
+	    MPTCP_SKB_CB(from)->offset ||
 	    ((to->len + from->len) > (limit >> 3)) ||
 	    !skb_try_coalesce(to, from, fragstolen, delta))
 		return false;
@@ -222,6 +221,15 @@ static bool mptcp_try_coalesce(struct sock *sk, struct sk_buff *to,
 	kfree_skb_partial(from, fragstolen);
 
 	return true;
+}
+
+static bool mptcp_ooo_try_coalesce(struct mptcp_sock *msk, struct sk_buff *to,
+				   struct sk_buff *from)
+{
+	if (MPTCP_SKB_CB(from)->map_seq != MPTCP_SKB_CB(to)->end_seq)
+		return false;
+
+	return mptcp_try_coalesce((struct sock *)msk, to, from);
 }
 
 /* "inspired" by tcp_rcvbuf_grow(), main difference:
@@ -279,8 +287,8 @@ static void mptcp_prune_ofo_queue(struct sock *sk,
 		struct sk_buff *skb = rb_to_skb(node);
 
 		/* Stop pruning if the incoming skb would land in OoO tail. */
-		if (after(MPTCP_SKB_CB(in_skb)->map_seq,
-			  MPTCP_SKB_CB(skb)->map_seq))
+		if (after64(MPTCP_SKB_CB(in_skb)->map_seq64,
+			    MPTCP_SKB_CB(skb)->map_seq64))
 			break;
 
 		pruned = true;
@@ -370,7 +378,7 @@ static void mptcp_data_queue_ofo(struct mptcp_sock *msk, struct sk_buff *skb)
 	/* with 2 subflows, adding at end of ooo queue is quite likely
 	 * Use of ooo_last_skb avoids the O(Log(N)) rbtree lookup.
 	 */
-	if (mptcp_try_coalesce(sk, msk->ooo_last_skb, skb)) {
+	if (mptcp_ooo_try_coalesce(msk, msk->ooo_last_skb, skb)) {
 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_OFOMERGE);
 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_OFOQUEUETAIL);
 		return;
@@ -416,7 +424,7 @@ static void mptcp_data_queue_ofo(struct mptcp_sock *msk, struct sk_buff *skb)
 				MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_DUPDATA);
 				goto merge_right;
 			}
-		} else if (mptcp_try_coalesce(sk, skb1, skb)) {
+		} else if (mptcp_ooo_try_coalesce(msk, skb1, skb)) {
 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_OFOMERGE);
 			return;
 		}
@@ -446,7 +454,8 @@ end:
 	skb_set_owner_r(skb, sk);
 }
 
-static void mptcp_init_skb(struct sock *ssk, struct sk_buff *skb, int offset)
+static void mptcp_init_skb(struct sock *ssk, struct sk_buff *skb, int offset,
+			   int copy_len)
 {
 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
 	bool has_rxtstamp = TCP_SKB_CB(skb)->has_rxtstamp;
@@ -454,42 +463,19 @@ static void mptcp_init_skb(struct sock *ssk, struct sk_buff *skb, int offset)
 	/* the skb map_seq accounts for the skb offset:
 	 * mptcp_subflow_get_mapped_dsn() is based on the current tp->copied_seq
 	 * value
-	 *
-	 * This is correct even when offset > 0 and mapping is out-of-order,
-	 * because consumed prefix bytes are part of the same logical DSN range.
-	 *
-	 * Note that end seq number is only available in 32bits format.
 	 */
-	MPTCP_SKB_CB(skb)->map_seq64 = mptcp_subflow_get_mapped_dsn(subflow) -
-				       offset;
+	MPTCP_SKB_CB(skb)->map_seq64 = mptcp_subflow_get_mapped_dsn(subflow);
 	MPTCP_SKB_CB(skb)->map_seq = (u32)MPTCP_SKB_CB(skb)->map_seq64;
-	MPTCP_SKB_CB(skb)->end_seq = MPTCP_SKB_CB(skb)->map_seq + skb->len;
+	MPTCP_SKB_CB(skb)->end_seq = MPTCP_SKB_CB(skb)->map_seq + copy_len;
+	MPTCP_SKB_CB(skb)->offset = offset;
 	MPTCP_SKB_CB(skb)->flags = 0;
 	MPTCP_SKB_CB(skb)->has_rxtstamp = has_rxtstamp;
+	MPTCP_SKB_CB(skb)->cant_coalesce = 0;
 
 	__skb_unlink(skb, &ssk->sk_receive_queue);
 
 	skb_ext_reset(skb);
 	skb_dst_drop(skb);
-}
-
-void __mptcp_sync_rcv_sequence(struct sock *sk)
-{
-	struct mptcp_sock *msk = mptcp_sk(sk);
-	struct sk_buff *skb;
-
-	if (likely(!msk->rcvd_dummy_seq))
-		return;
-
-	/* User space can have already received the TFO skb. */
-	msk->rcvd_dummy_seq = false;
-	skb = skb_peek_tail(&sk->sk_receive_queue);
-	if (!skb)
-		return;
-
-	MPTCP_SKB_CB(skb)->map_seq64 = msk->tfo_iasn - skb->len;
-	MPTCP_SKB_CB(skb)->map_seq = (u32)MPTCP_SKB_CB(skb)->map_seq64;
-	MPTCP_SKB_CB(skb)->end_seq = MPTCP_SKB_CB(skb)->map_seq + skb->len;
 }
 
 static bool __mptcp_move_skb(struct sock *sk, struct sk_buff *skb)
@@ -499,12 +485,6 @@ static bool __mptcp_move_skb(struct sock *sk, struct sk_buff *skb)
 	struct sk_buff *tail;
 
 	mptcp_borrow_fwdmem(sk, skb);
-
-	/* Be sure to sync the eventual fastopen dummy mapping before any other
-	 * skb lands into the msk.
-	 */
-	if (unlikely(msk->rcvd_dummy_seq))
-		__mptcp_sync_rcv_sequence(sk);
 
 	if (msk->repair &&
 	    MPTCP_SKB_CB(skb)->map_seq64 == 0) {
@@ -542,6 +522,10 @@ insert:
 	/* Partial packet */
 	if (after64(MPTCP_SKB_CB(skb)->map_seq64 + skb->len, msk->ack_seq)) {
 		copy_len = MPTCP_SKB_CB(skb)->end_seq - (u32)msk->ack_seq;
+		MPTCP_SKB_CB(skb)->offset += msk->ack_seq -
+					     MPTCP_SKB_CB(skb)->map_seq;
+		MPTCP_SKB_CB(skb)->map_seq += (u32)msk->ack_seq -
+					      MPTCP_SKB_CB(skb)->map_seq;
 		goto insert;
 	}
 
@@ -835,7 +819,8 @@ static void __mptcp_add_backlog(struct sock *sk,
 	if (!list_empty(&msk->backlog_list))
 		tail = list_last_entry(&msk->backlog_list, struct sk_buff, list);
 
-	if (tail && ssk == tail->sk &&
+	if (tail && MPTCP_SKB_CB(skb)->map_seq == MPTCP_SKB_CB(tail)->end_seq &&
+	    ssk == tail->sk &&
 	    __mptcp_try_coalesce(sk, tail, skb, &fragstolen, &delta)) {
 		skb->truesize -= delta;
 		kfree_skb_partial(skb, fragstolen);
@@ -899,7 +884,7 @@ static bool __mptcp_move_skbs_from_subflow(struct mptcp_sock *msk,
 		if (offset < skb->len) {
 			size_t len = skb->len - offset;
 
-			mptcp_init_skb(ssk, skb, offset);
+			mptcp_init_skb(ssk, skb, offset, len);
 
 			if (own_msk) {
 				mptcp_subflow_lend_fwdmem(subflow, skb);
@@ -959,10 +944,15 @@ static bool __mptcp_ofo_queue(struct mptcp_sock *msk)
 
 		seq_delta = MPTCP_SKB_CB(skb)->end_seq - ack_seq;
 		tail = skb_peek_tail(&sk->sk_receive_queue);
-		if (!tail || !mptcp_try_coalesce(sk, tail, skb)) {
+		if (!tail || !mptcp_ooo_try_coalesce(msk, tail, skb)) {
+			int delta = ack_seq - MPTCP_SKB_CB(skb)->map_seq;
+
+			/* skip overlapping data, if any */
 			pr_debug("uncoalesced seq=%x ack seq=%x delta=%d\n",
 				 MPTCP_SKB_CB(skb)->map_seq, ack_seq,
-				 ack_seq - MPTCP_SKB_CB(skb)->map_seq);
+				 delta);
+			MPTCP_SKB_CB(skb)->offset += delta;
+			MPTCP_SKB_CB(skb)->map_seq += delta;
 			__skb_queue_tail(&sk->sk_receive_queue, skb);
 		}
 		msk->bytes_received += seq_delta;
@@ -2426,24 +2416,31 @@ static void mptcp_eat_recv_skb(struct sock *sk, struct sk_buff *skb)
 }
 
 static int __mptcp_recvmsg_mskq(struct sock *sk, struct msghdr *msg,
-				size_t len, int flags, u64 *seq,
+				size_t len, int flags, int copied_total,
 				struct scm_timestamping_internal *tss,
 				int *cmsg_flags, struct sk_buff **last)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
 	struct sk_buff *skb, *tmp;
+	int total_data_len = 0;
 	int copied = 0;
 
 	skb_queue_walk_safe(&sk->sk_receive_queue, skb, tmp) {
-		u32 offset = (u32)(*seq) - MPTCP_SKB_CB(skb)->map_seq;
+		u32 delta, offset = MPTCP_SKB_CB(skb)->offset;
 		u32 data_len = skb->len - offset;
 		u32 count;
 		int err;
 
-		/* Skip the already peeked data. */
-		if (offset >= skb->len) {
-			*last = skb;
-			continue;
+		if (flags & MSG_PEEK) {
+			if (total_data_len + data_len <= copied_total) {
+				total_data_len += data_len;
+				*last = skb;
+				continue;
+			}
+
+			delta = copied_total - total_data_len;
+			offset += delta;
+			data_len -= delta;
 		}
 
 		count = min_t(size_t, len - copied, data_len);
@@ -2469,12 +2466,15 @@ static int __mptcp_recvmsg_mskq(struct sock *sk, struct msghdr *msg,
 		}
 
 		copied += count;
-		*seq += count;
 
 		if (!(flags & MSG_PEEK)) {
 			msk->bytes_consumed += count;
-			if (count < data_len)
+			msk->copied_seq += count;
+			if (count < data_len) {
+				MPTCP_SKB_CB(skb)->offset += count;
+				MPTCP_SKB_CB(skb)->map_seq += count;
 				break;
+			}
 
 			mptcp_eat_recv_skb(sk, skb);
 		} else {
@@ -2614,15 +2614,7 @@ static bool mptcp_move_skbs(struct sock *sk)
 	u32 moved = 0;
 
 	mptcp_data_lock(sk);
-	while (1) {
-		if (__test_and_clear_bit(MPTCP_SYNC_SEQ, &msk->cb_flags)) {
-			msk->copied_seq += msk->tfo_iasn;
-			__mptcp_sync_rcv_sequence(sk);
-		}
-
-		if (!mptcp_can_spool_backlog(sk, &skbs))
-			break;
-
+	while (mptcp_can_spool_backlog(sk, &skbs)) {
 		mptcp_data_unlock(sk);
 		enqueued |= __mptcp_move_skbs(sk, &skbs, &moved);
 
@@ -2661,7 +2653,6 @@ int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags)
 	struct mptcp_sock *msk = mptcp_sk(sk);
 	struct scm_timestamping_internal tss;
 	int copied = 0, cmsg_flags = 0;
-	u64 peek_seq, *seq;
 	int target;
 	long timeo;
 
@@ -2680,11 +2671,6 @@ int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags)
 
 	len = min_t(size_t, len, INT_MAX);
 	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
-	seq = &msk->copied_seq;
-	if (flags & MSG_PEEK) {
-		peek_seq = msk->copied_seq;
-		seq = &peek_seq;
-	}
 
 	if (unlikely(msk->recvmsg_inq))
 		cmsg_flags = MPTCP_CMSG_INQ;
@@ -2694,7 +2680,7 @@ int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags)
 		int err, bytes_read;
 
 		bytes_read = __mptcp_recvmsg_mskq(sk, msg, len - copied, flags,
-						  seq, &tss, &cmsg_flags,
+						  copied, &tss, &cmsg_flags,
 						  &last);
 		if (unlikely(bytes_read < 0)) {
 			if (!copied)
@@ -2704,11 +2690,8 @@ int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags)
 
 		copied += bytes_read;
 
-		if (!list_empty(&msk->backlog_list) && mptcp_move_skbs(sk)) {
-			if (flags & MSG_PEEK)
-				peek_seq = msk->copied_seq + copied;
+		if (!list_empty(&msk->backlog_list) && mptcp_move_skbs(sk))
 			continue;
-		}
 
 		/* only the MPTCP socket status is relevant here. The exit
 		 * conditions mirror closely tcp_recvmsg()
@@ -2751,10 +2734,6 @@ int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags)
 			copied = copied ? : err;
 			goto out_err;
 		}
-
-		/* Recompute peek offset after eventual seq resync. */
-		if (flags & MSG_PEEK)
-			peek_seq = msk->copied_seq + copied;
 	}
 
 	mptcp_cleanup_rbuf(msk, copied);
@@ -4002,8 +3981,6 @@ static int mptcp_disconnect(struct sock *sk, int flags)
 	msk->bytes_retrans = 0;
 	msk->rcvspace_init = 0;
 	msk->fastclosing = 0;
-	msk->tfo_iasn = 0;
-	msk->rcvd_dummy_seq = false;
 	msk->read_copied = 0;
 	mptcp_init_rtt_est(msk);
 
@@ -4228,11 +4205,6 @@ static void mptcp_release_cb(struct sock *sk)
 		unsigned long flags = (msk->cb_flags & MPTCP_FLAGS_PROCESS_CTX_NEED);
 		struct list_head join_list, skbs;
 		bool spool_bl;
-
-		if (__test_and_clear_bit(MPTCP_SYNC_SEQ, &msk->cb_flags)) {
-			msk->copied_seq += msk->tfo_iasn;
-			__mptcp_sync_rcv_sequence(sk);
-		}
 
 		spool_bl = mptcp_can_spool_backlog(sk, &skbs);
 		if (!flags && !spool_bl)
@@ -5307,11 +5279,8 @@ struct sk_buff *mptcp_drain_pre_tls_data(struct sock *sk)
 	struct sk_buff *skb, *copy;
 	u32 offset, drain_len;
 
-	if (!msk->rcvd_dummy_seq && !test_bit(MPTCP_SYNC_SEQ, &msk->cb_flags))
-		return NULL;
-
 	skb = mptcp_recv_skb(sk, &offset);
-	if (!skb)
+	if (!skb || !MPTCP_SKB_CB(skb)->cant_coalesce)
 		return NULL;
 
 	drain_len = MPTCP_SKB_CB(skb)->end_seq - MPTCP_SKB_CB(skb)->map_seq - offset;
@@ -5327,10 +5296,7 @@ struct sk_buff *mptcp_drain_pre_tls_data(struct sock *sk)
 		return NULL;
 	}
 
-	msk->rcvd_dummy_seq = false;
-	if (test_and_clear_bit(MPTCP_SYNC_SEQ, &msk->cb_flags))
-		msk->copied_seq += msk->tfo_iasn;
-
+	MPTCP_SKB_CB(skb)->cant_coalesce = 0;
 	MPTCP_SKB_CB(skb)->map_seq64 = msk->copied_seq;
 	MPTCP_SKB_CB(skb)->map_seq = (u32)msk->copied_seq;
 
