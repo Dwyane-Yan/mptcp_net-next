@@ -437,11 +437,17 @@ static bool tls_strp_check_queue_ok(struct tls_strparser *strp,
 {
 	unsigned int remaining = strp->stm.offset + len;
 	struct sk_buff *first, *skb;
+	bool is_mptcp = strp->sk->sk_protocol == IPPROTO_MPTCP;
 	u32 seq;
 
 	first = skb_shinfo(strp->anchor)->frag_list;
 	skb = first;
 	seq = TLS_SKB_CB(first)->seq;
+	/* MPTCP map_seq tracks the first unconsumed byte: rewind the
+	 * consumed prefix to compare against the skb head sequence.
+	 */
+	if (is_mptcp)
+		seq = mptcp_skb_head_seq(first);
 
 	/* Make sure there's no duplicate data in the queue,
 	 * and the decrypted status matches.
@@ -451,7 +457,8 @@ static bool tls_strp_check_queue_ok(struct tls_strparser *strp,
 		remaining -= skb->len;
 		skb = skb->next;
 
-		if (TLS_SKB_CB(skb)->seq != seq)
+		if ((is_mptcp ? mptcp_skb_head_seq(skb) :
+				TLS_SKB_CB(skb)->seq) != seq)
 			return false;
 		if (skb_cmp_decrypted(first, skb))
 			return false;

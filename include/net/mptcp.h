@@ -257,6 +257,8 @@ int mptcp_bpf_strp_read_sock(struct strparser *strp, read_descriptor_t *desc,
 u64 mptcp_sk_copied_seq(struct sock *sk);
 
 struct sk_buff *mptcp_drain_pre_tls_data(struct sock *sk);
+
+u32 mptcp_skb_head_seq(const struct sk_buff *skb);
 #else
 
 static inline void mptcp_init(void)
@@ -362,6 +364,11 @@ static inline u64 mptcp_sk_copied_seq(struct sock *sk)
 static inline struct sk_buff *mptcp_drain_pre_tls_data(struct sock *sk)
 {
 	return NULL;
+}
+
+static inline u32 mptcp_skb_head_seq(const struct sk_buff *skb)
+{
+	return 0;
 }
 #endif /* CONFIG_MPTCP */
 

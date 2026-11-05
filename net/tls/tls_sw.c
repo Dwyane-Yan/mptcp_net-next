@@ -2317,6 +2317,16 @@ int tls_rx_msg_size(struct tls_strparser *strp, struct sk_buff *skb)
 		goto read_failure;
 	}
 
+	/* MPTCP map_seq tracks the first unconsumed byte; rewind the
+	 * consumed prefix to get the skb head sequence.
+	 */
+	if (strp->sk->sk_protocol == IPPROTO_MPTCP) {
+		tls_device_rx_resync_new_rec(strp->sk, data_len + TLS_HEADER_SIZE,
+					     mptcp_skb_head_seq(skb) +
+					     strp->stm.offset);
+		return data_len + TLS_HEADER_SIZE;
+	}
+
 	tls_device_rx_resync_new_rec(strp->sk, data_len + TLS_HEADER_SIZE,
 				     TLS_SKB_CB(skb)->seq + strp->stm.offset);
 	return data_len + TLS_HEADER_SIZE;

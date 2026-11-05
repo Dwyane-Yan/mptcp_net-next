@@ -339,7 +339,8 @@ static void mptcp_data_queue_ofo(struct mptcp_sock *msk, struct sk_buff *skb)
 	u32 seq;
 
 	seq = MPTCP_SKB_CB(skb)->map_seq;
-	end_seq = MPTCP_SKB_CB(skb)->map_seq64 + skb->len;
+	end_seq = MPTCP_SKB_CB(skb)->map_seq64 + skb->len -
+		  MPTCP_SKB_CB(skb)->offset;
 	max_seq = atomic64_read(&msk->rcv_wnd_sent);
 	if (after64(READ_ONCE(msk->ack_seq), max_seq))
 		max_seq = READ_ONCE(msk->ack_seq);
@@ -526,6 +527,7 @@ insert:
 					     MPTCP_SKB_CB(skb)->map_seq;
 		MPTCP_SKB_CB(skb)->map_seq += (u32)msk->ack_seq -
 					      MPTCP_SKB_CB(skb)->map_seq;
+		MPTCP_SKB_CB(skb)->map_seq64 = msk->ack_seq;
 		goto insert;
 	}
 
@@ -953,6 +955,7 @@ static bool __mptcp_ofo_queue(struct mptcp_sock *msk)
 				 delta);
 			MPTCP_SKB_CB(skb)->offset += delta;
 			MPTCP_SKB_CB(skb)->map_seq += delta;
+			MPTCP_SKB_CB(skb)->map_seq64 = msk->ack_seq;
 			__skb_queue_tail(&sk->sk_receive_queue, skb);
 		}
 		msk->bytes_received += seq_delta;
@@ -2473,6 +2476,7 @@ static int __mptcp_recvmsg_mskq(struct sock *sk, struct msghdr *msg,
 			if (count < data_len) {
 				MPTCP_SKB_CB(skb)->offset += count;
 				MPTCP_SKB_CB(skb)->map_seq += count;
+				MPTCP_SKB_CB(skb)->map_seq64 += count;
 				break;
 			}
 
@@ -4992,12 +4996,13 @@ static __poll_t mptcp_poll(struct file *file, struct socket *sock,
 
 static struct sk_buff *mptcp_recv_skb(struct sock *sk, u32 *off)
 {
-	struct mptcp_sock *msk = mptcp_sk(sk);
 	struct sk_buff *skb;
+	struct mptcp_sock *msk = mptcp_sk(sk);
 	u32 offset;
 
 	while ((skb = skb_peek(&sk->sk_receive_queue)) != NULL) {
-		offset = (u32)msk->copied_seq - MPTCP_SKB_CB(skb)->map_seq;
+		offset = (u32)msk->copied_seq - MPTCP_SKB_CB(skb)->map_seq + MPTCP_SKB_CB(skb)->offset;
+		//offset = MPTCP_SKB_CB(skb)->offset;
 		if (offset < skb->len) {
 			*off = offset;
 			return skb;
@@ -5043,8 +5048,12 @@ static int __mptcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 
 		msk->bytes_consumed += count;
 		msk->copied_seq += count;
-		if (count < data_len)
+		if (count < data_len) {
+			MPTCP_SKB_CB(skb)->offset += count;
+			MPTCP_SKB_CB(skb)->map_seq += count;
+			MPTCP_SKB_CB(skb)->map_seq64 += count;
 			break;
+		}
 
 		mptcp_eat_recv_skb(sk, skb);
 		if (!desc->count)
@@ -5259,8 +5268,12 @@ static void mptcp_read_done(struct sock *sk, size_t len)
 		msk->copied_seq += used;
 		left -= used;
 
-		if (skb->len > offset + used)
+		if (skb->len > offset + used) {
+			MPTCP_SKB_CB(skb)->offset += used;
+			MPTCP_SKB_CB(skb)->map_seq += used;
+			MPTCP_SKB_CB(skb)->map_seq64 += used;
 			break;
+		}
 
 		mptcp_eat_recv_skb(sk, skb);
 	}
@@ -5500,6 +5513,15 @@ u64 mptcp_sk_copied_seq(struct sock *sk)
 {
 	return READ_ONCE(mptcp_sk(sk)->copied_seq);
 }
+
+/* DSN of the skb buffer head: map_seq tracks the first unconsumed
+ * byte, rewind the consumed prefix to get the head sequence.
+ */
+u32 mptcp_skb_head_seq(const struct sk_buff *skb)
+{
+	return MPTCP_SKB_CB(skb)->map_seq - MPTCP_SKB_CB(skb)->offset;
+}
+EXPORT_SYMBOL_GPL(mptcp_skb_head_seq);
 
 static bool mptcp_recv_ready(const struct sock *sk)
 {

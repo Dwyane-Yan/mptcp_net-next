@@ -12,6 +12,9 @@ int redirect_idx;
 int redirect_flags;
 int trace_port;
 int helper_ret;
+int verdict_drop;
+int pass_cnt;
+int drop_cnt;
 struct {
 	__uint(type, BPF_MAP_TYPE_SOCKMAP);
 	__uint(key_size, sizeof(__u32));
@@ -54,4 +57,19 @@ int mptcp_sockmap_msg_verdict(struct sk_msg_md *msg)
 	/* redirect msg to the sk under sock_map[redirect_idx] */
 	return bpf_msg_redirect_map(msg, &sock_map, redirect_idx,
 				    redirect_flags);
+}
+
+SEC("sk_skb/stream_verdict")
+int mptcp_sockmap_pass_drop(struct __sk_buff *skb)
+{
+	/* drop everything when asked to, pass the data into the
+	 * socket's own ingress queue otherwise
+	 */
+	if (verdict_drop) {
+		__sync_fetch_and_add(&drop_cnt, 1);
+		return SK_DROP;
+	}
+
+	__sync_fetch_and_add(&pass_cnt, 1);
+	return SK_PASS;
 }

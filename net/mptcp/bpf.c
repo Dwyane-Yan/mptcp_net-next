@@ -360,6 +360,7 @@ late_initcall(bpf_mptcp_kfunc_init);
 void mptcp_eat_skb(struct sock *sk, struct sk_buff *skb)
 {
 	struct mptcp_sock *msk;
+	u32 len;
 
 	if (!skb || !skb->len || !msk_is_mptcp(sk))
 		return;
@@ -368,9 +369,10 @@ void mptcp_eat_skb(struct sock *sk, struct sk_buff *skb)
 		return;
 
 	msk = mptcp_sk(sk);
-	WRITE_ONCE(msk->bytes_consumed, msk->bytes_consumed + skb->len);
-	WRITE_ONCE(msk->copied_seq, msk->copied_seq + skb->len);
-	msk->read_copied += skb->len;
+	len = skb->len - MPTCP_SKB_CB(skb)->offset;
+	WRITE_ONCE(msk->bytes_consumed, msk->bytes_consumed + len);
+	WRITE_ONCE(msk->copied_seq, msk->copied_seq + len);
+	msk->read_copied += len;
 	set_bit(MPTCP_WORK_READ_COMPLETE, &msk->flags);
 	mptcp_schedule_work(sk);
 }
@@ -405,7 +407,7 @@ static int mptcp_bpf_recvmsg_parser(struct sock *sk, struct msghdr *msg,
 	struct sk_psock *psock;
 	struct mptcp_sock *msk;
 	int copied = 0;
-	u64 seq;
+	u64 seq, orig_seq;
 
 	if (unlikely(flags & MSG_ERRQUEUE))
 		return inet_recv_error(sk, msg, len);
@@ -426,6 +428,7 @@ static int mptcp_bpf_recvmsg_parser(struct sock *sk, struct msghdr *msg,
 	lock_sock(sk);
 	msk = mptcp_sk(sk);
 	seq = READ_ONCE(msk->copied_seq);
+	orig_seq = seq;
 
 msg_bytes_ready:
 	copied = __sk_msg_recvmsg(sk, psock, msg, len, flags,
@@ -438,8 +441,18 @@ msg_bytes_ready:
 			goto msg_bytes_ready;
 	}
 	if (copied >= 0) {
-		if (!peek)
+		if (!peek) {
+			/* The verdict path moved this data out of the
+			 * receive queue without going through
+			 * __mptcp_read_sock, so the consumed accounting
+			 * has to happen here: mptcp_data_avail() is
+			 * bytes_received - bytes_consumed, keep it in
+			 * lockstep with the copied_seq cursor.
+			 */
+			WRITE_ONCE(msk->bytes_consumed,
+				   msk->bytes_consumed + (seq - orig_seq));
 			WRITE_ONCE(msk->copied_seq, seq);
+		}
 		if (copied > 0) {
 			msk->read_copied += copied;
 			set_bit(MPTCP_WORK_READ_COMPLETE, &msk->flags);

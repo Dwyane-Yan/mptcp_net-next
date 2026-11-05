@@ -133,8 +133,8 @@ mptcp_lib_pm_nl_show_endpoints "$ns1"
 #-r tls.12_aria_gcm_256_mptcp.mutliproc_sendpage_even \
 #-r tls.12_aria_gcm_256_mptcp.mutliproc_sendpage_readers \
 #-r tls.12_aria_gcm_256_mptcp.mutliproc_sendpage_writers &
-#ip netns exec "$ns1" ./tls &
-ip netns exec "$ns1" ./tls -t sendmsg_large &
+ip netns exec "$ns1" ./tls &
+#ip netns exec "$ns1" ./tls -t sendmsg_large &
 #ip netns exec "$ns1" ./tls -v 12_aes_gcm_mptcp \
 #			   -v 13_aes_gcm \
 #			   -v 12_chacha_mptcp \

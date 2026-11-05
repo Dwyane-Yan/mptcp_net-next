@@ -8,6 +8,8 @@
 #include <test_progs.h>
 #include <unistd.h>
 #include <errno.h>
+#include <poll.h>
+#include <string.h>
 #include "cgroup_helpers.h"
 #include "network_helpers.h"
 #include "mptcp_sock.skel.h"
@@ -712,6 +714,269 @@ end:
 	close(listen_fd);
 }
 
+/* Deterministic, position-dependent byte pattern: any duplicated, lost
+ * or shifted chunk breaks the comparison immediately.
+ */
+static unsigned char stream_byte(unsigned long off)
+{
+	return (unsigned char)((off * 2654435761UL) >> 16);
+}
+
+static void stream_fill(unsigned char *buf, unsigned long off, unsigned int len)
+{
+	unsigned int j;
+
+	for (j = 0; j < len; j++)
+		buf[j] = stream_byte(off + j);
+}
+
+/* Receive from @fd and verify incrementally against the pattern at
+ * *@got. Returns  1 when *@got == want,
+ *		 0 when nothing more is available right now,
+ *		-1 on data mismatch (*bad_off set),
+ *		-2 on fatal error.
+ */
+static int stream_rx(int fd, unsigned char *buf, unsigned long *got,
+		     unsigned long want, int timeout_ms, unsigned long *bad_off,
+		     unsigned char *bad_byte)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	unsigned int j;
+	int len;
+
+	while (*got < want) {
+		/* recv first: poll can't see data still sitting in the
+		 * mptcp backlog, only recvmsg spools it
+		 */
+		len = recv(fd, buf, 65536, MSG_DONTWAIT);
+		if (len < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				if (poll(&pfd, 1, timeout_ms) == 0)
+					return 0;
+				continue;
+			}
+			if (errno == EINTR)
+				continue;
+			return -2;
+		}
+		if (!len)
+			return -2;
+
+		for (j = 0; j < (unsigned int)len; j++) {
+			if (buf[j] != stream_byte(*got + j)) {
+				*bad_off = *got + j;
+				*bad_byte = buf[j];
+				*got += j;
+				return -1;
+			}
+		}
+		*got += len;
+	}
+
+	return 1;
+}
+
+/* Push a large volume of variable-sized records through the sockmap
+ * RX path (SK_PASS), drop a batch in the middle (SK_DROP, exercising
+ * the verdict-consume accounting) and resume passing data.  Varied
+ * send sizes make the DSS mapping boundaries land inside the
+ * coalesced TCP skbs, which is the offset-heavy corner case.
+ */
+#define LARGE_XFER_ROUNDS	200
+#define LARGE_XFER_DROPS	64
+#define LARGE_XFER_RESUME	100
+#define LARGE_XFER_MAX_SZ	65536
+
+static void test_sockmap_large_transfer(struct mptcp_sockmap *skel)
+{
+	int listen_fd = -1, server_fd = -1, client_fd = -1;
+	int map_fd, redir_fd, verdict_fd;
+	unsigned long delivered = 0, got = 0, bad_off = 0;
+	unsigned char bad_byte = 0;
+	unsigned char *buf;
+	int err, i, ret, retries, len;
+	unsigned int sz;
+
+	buf = malloc(LARGE_XFER_MAX_SZ);
+	if (!ASSERT_OK_PTR(buf, "large:malloc"))
+		return;
+
+	listen_fd = start_mptcp_server(AF_INET, NULL, 0, 0);
+	if (!ASSERT_GE(listen_fd, 0, "large:start_mptcp_server"))
+		goto free_buf;
+
+	skel->bss->trace_port = ntohs(get_socket_local_port(listen_fd));
+	skel->bss->sk_index = 0;
+	skel->bss->verdict_drop = 0;
+
+	map_fd = bpf_map__fd(skel->maps.sock_map);
+	redir_fd = bpf_program__fd(skel->progs.mptcp_sockmap_redirect);
+	verdict_fd = bpf_program__fd(skel->progs.mptcp_sockmap_pass_drop);
+
+	/* A psock copies the map's verdict prog at insertion time:
+	 * attaching a new prog afterwards does not reach sockets already
+	 * in the map.  Swap the always-redirect verdict for the pass/drop
+	 * one BEFORE the connection (and its psock) is created.
+	 */
+	err = bpf_prog_detach2(redir_fd, map_fd, BPF_SK_SKB_STREAM_VERDICT);
+	if (!ASSERT_OK(err, "large:detach redirect verdict"))
+		goto close_listen;
+	err = bpf_prog_attach(verdict_fd, map_fd, BPF_SK_SKB_STREAM_VERDICT, 0);
+	if (!ASSERT_OK(err, "large:attach pass/drop verdict"))
+		goto reattach;
+
+	client_fd = connect_to_fd(listen_fd, 0);
+	if (!ASSERT_OK_FD(client_fd, "large:connect_to_fd"))
+		goto reattach;
+
+	if (!ASSERT_EQ(skel->bss->helper_ret, 0, "large:sockops map update"))
+		goto reattach;
+
+	server_fd = accept(listen_fd, NULL, 0);
+	if (!ASSERT_OK_FD(server_fd, "large:accept"))
+		goto reattach;
+
+	/* phase 1: pass everything */
+	for (i = 0; i < LARGE_XFER_ROUNDS; i++) {
+		sz = (i % 16 == 15) ? LARGE_XFER_MAX_SZ :
+		     4096 + (i % 7) * 3571 + (i % 3);
+		stream_fill(buf, delivered, sz);
+		if (!ASSERT_EQ(send(client_fd, buf, sz, 0), (int)sz,
+			       "large:send pass"))
+			goto detach;
+		delivered += sz;
+
+		/* best-effort drain so the sender never stalls on a
+		 * full ingress queue
+		 */
+		if ((i & 7) == 7) {
+			ret = stream_rx(server_fd, buf, &got, delivered, 0,
+					&bad_off, &bad_byte);
+			if (ret < 0)
+				goto rx_fail;
+		}
+	}
+
+	/* Fully drain phase 1 BEFORE flipping the verdict: it applies per
+	 * skb, so data still queued (e.g. sitting in the mptcp backlog)
+	 * would be dropped together with the phase 2 skbs and punch a
+	 * hole into the verified stream.
+	 */
+	for (retries = 50; retries; retries--) {
+		ret = stream_rx(server_fd, buf, &got, delivered, 200,
+				&bad_off, &bad_byte);
+		if (ret < 0)
+			goto rx_fail;
+		if (ret == 1)
+			break;
+	}
+	if (!ASSERT_EQ(got, delivered, "large:phase1 drain"))
+		goto detach;
+
+	/* phase 2: drop a full batch, no byte must survive.  The payload
+	 * is a marker that can never match the stream pattern: any byte
+	 * leaking through the drop verdict fails the verify loudly.
+	 */
+	skel->bss->verdict_drop = 1;
+	for (i = 0; i < LARGE_XFER_DROPS; i++) {
+		sz = 4096 + (i % 5) * 4733 + (i % 3);
+		memset(buf, 0xAA, sz);
+		if (!ASSERT_EQ(send(client_fd, buf, sz, 0), (int)sz,
+			       "large:send drop"))
+			goto detach;
+	}
+
+	/* drain the tail of phase 1 (data may still sit in the mptcp
+	 * backlog), then the socket must stay idle: no dropped byte may
+	 * have leaked into the stream
+	 */
+	for (retries = 25; retries; retries--) {
+		ret = stream_rx(server_fd, buf, &got, delivered, 100, &bad_off, &bad_byte);
+		if (ret < 0)
+			goto rx_fail;
+		if (ret == 1)
+			break;
+	}
+	{
+		struct pollfd idle = { .fd = server_fd, .events = POLLIN };
+		int readable = poll(&idle, 1, 200);
+
+		if (readable) {
+			len = recv(server_fd, buf, 256, MSG_DONTWAIT);
+			printf("large:drop idle leak: got=%lu delivered=%lu extra=%d first=%02x pattern_at_got=%02x pass_cnt=%d drop_cnt=%d\n",
+			       got, delivered, len,
+			       len > 0 ? buf[0] : 0,
+			       len > 0 ? stream_byte(got) : 0,
+			       skel->bss->pass_cnt, skel->bss->drop_cnt);
+		}
+		if (!ASSERT_EQ(readable, 0, "large:drop phase idle"))
+			goto detach;
+	}
+
+	/* phase 3: pass again, the stream must resume at the exact
+	 * position where phase 1 ended
+	 */
+	skel->bss->verdict_drop = 0;
+	for (i = 0; i < LARGE_XFER_RESUME; i++) {
+		sz = 4096 + (i % 6) * 3821 + (i % 3);
+		stream_fill(buf, delivered, sz);
+		if (!ASSERT_EQ(send(client_fd, buf, sz, 0), (int)sz,
+			       "large:send resume"))
+			goto detach;
+		delivered += sz;
+
+		if ((i & 7) == 7) {
+			ret = stream_rx(server_fd, buf, &got, delivered, 0,
+					&bad_off, &bad_byte);
+			if (ret < 0)
+				goto rx_fail;
+		}
+	}
+
+	/* final drain */
+	for (retries = 50; retries; retries--) {
+		ret = stream_rx(server_fd, buf, &got, delivered, 200, &bad_off, &bad_byte);
+		if (ret < 0)
+			goto rx_fail;
+		if (ret == 1)
+			break;
+	}
+	printf("large:counters pass_cnt=%d drop_cnt=%d got=%lu delivered=%lu\n",
+	       skel->bss->pass_cnt, skel->bss->drop_cnt, got, delivered);
+	if (!ASSERT_EQ(got, delivered, "large:total received"))
+		goto detach;
+
+	/* everything consumed: no stuck data must be left behind */
+	{
+		struct pollfd idle = { .fd = server_fd, .events = POLLIN };
+
+		if (!ASSERT_EQ(poll(&idle, 1, 200), 0, "large:final idle"))
+			goto detach;
+		if (!ASSERT_EQ(recv(server_fd, buf, 1, MSG_DONTWAIT), -1,
+			       "large:final recv"))
+			goto detach;
+		if (!ASSERT_EQ(errno, EAGAIN, "large:final errno"))
+			goto detach;
+	}
+
+	goto detach;
+
+rx_fail:
+	PRINT_FAIL("large:stream mismatch got=%lu want=%lu bad_off=%lu byte=%02x expect=%02x ret=%d\n",
+		   got, delivered, bad_off, bad_byte,
+		   bad_off < delivered ? stream_byte(bad_off) : 0, ret);
+detach:
+	bpf_prog_detach2(verdict_fd, map_fd, BPF_SK_SKB_STREAM_VERDICT);
+reattach:
+	bpf_prog_attach(redir_fd, map_fd, BPF_SK_SKB_STREAM_VERDICT, 0);
+	close(server_fd);
+	close(client_fd);
+close_listen:
+	close(listen_fd);
+free_buf:
+	free(buf);
+}
+
 static void test_mptcp_sockmap(void)
 {
 	struct mptcp_sockmap *skel;
@@ -748,6 +1013,7 @@ static void test_mptcp_sockmap(void)
 	test_sockmap_with_mptcp_fallback(skel);
 	test_sockmap_with_mptcp(skel);
 	test_sockmap_mptcp_support(skel);
+	test_sockmap_large_transfer(skel);
 
 close_netns:
 	netns_free(netns);
