@@ -438,6 +438,13 @@ static void mptcp_init_skb(struct sock *ssk, struct sk_buff *skb, int offset,
 	MPTCP_SKB_CB(skb)->map_seq = mptcp_subflow_get_mapped_dsn(subflow);
 	MPTCP_SKB_CB(skb)->end_seq = MPTCP_SKB_CB(skb)->map_seq + copy_len;
 	MPTCP_SKB_CB(skb)->offset = offset;
+	/* DSN of the skb head: map_seq and offset advance in lockstep on
+	 * every partial consume and trim, so map_seq - offset is invariant
+	 * from here on. The low 32 bits are all the TLS_SKB_CB() overlay
+	 * needs: the strparser chains skbs with mod-2^32 equality, and
+	 * adjacent queued data can never be 2^32 apart.
+	 */
+	MPTCP_SKB_CB(skb)->head_seq = (u32)(MPTCP_SKB_CB(skb)->map_seq - offset);
 	MPTCP_SKB_CB(skb)->has_rxtstamp = has_rxtstamp;
 	MPTCP_SKB_CB(skb)->cant_coalesce = 0;
 

@@ -129,7 +129,8 @@
 #define MPTCP_SYNC_SNDBUF	7
 
 struct mptcp_skb_cb {
-	u64 map_seq;
+	u32 head_seq;	/* DSN of skb position 0, immutable once queued */
+	u64 map_seq;	/* DSN of the first unconsumed byte (data[offset]) */
 	u64 end_seq;
 	u32 offset;
 	u8  has_rxtstamp;
@@ -138,7 +139,7 @@ struct mptcp_skb_cb {
 
 #define MPTCP_SKB_CB(__skb)	((struct mptcp_skb_cb *)&((__skb)->cb[0]))
 
-static_assert(offsetof(struct mptcp_skb_cb, map_seq) == 0);
+static_assert(offsetof(struct mptcp_skb_cb, head_seq) == 0);
 
 static inline bool before64(__u64 seq1, __u64 seq2)
 {
