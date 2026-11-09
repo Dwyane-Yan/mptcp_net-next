@@ -707,6 +707,160 @@ end:
 	close(listen_fd);
 }
 
+/* Test sockmap large data transfer, in the spirit of the KTLS
+ * sendmsg_large test: 'sends' chunks of 'send_len' bytes (2M in total)
+ * through both redirect paths, checking size, order and content of
+ * every received chunk.
+ */
+static void test_sockmap_large(struct mptcp_sockmap *skel)
+{
+	int listen_fd = -1, server_fd = -1, client_fd = -1;
+	int err, zero = 0, one = 1, map_fd, msg_fd;
+	size_t send_len = 16384, sends = 128;
+	size_t recvd, i;
+	int sent;
+	unsigned char *snd, *rcv;
+
+	snd = malloc(send_len);
+	rcv = malloc(send_len);
+	if (!ASSERT_OK_PTR(snd, "malloc") || !ASSERT_OK_PTR(rcv, "malloc"))
+		goto free_bufs;
+
+	/* per-chunk header at [0, sizeof(i)): the chunk index; the rest is
+	 * a fixed pattern, so both reordering and corruption are caught
+	 */
+	for (i = sizeof(i); i < send_len; i++)
+		snd[i] = (unsigned char)(i * 3 + 1);
+
+	listen_fd = start_mptcp_server(AF_INET, NULL, 0, 0);
+	if (!ASSERT_OK_FD(listen_fd, "start_mptcp_server"))
+		goto free_bufs;
+
+	skel->bss->trace_port = ntohs(get_socket_local_port(listen_fd));
+	skel->bss->sk_index = 0;
+	skel->bss->helper_ret = -1;
+
+	client_fd = connect_to_fd(listen_fd, 0);
+	if (!ASSERT_OK_FD(client_fd, "connect_to_fd client_fd"))
+		goto close_listen;
+
+	if (!ASSERT_EQ(skel->bss->helper_ret, 0, "sockops update"))
+		goto close_fds;
+
+	server_fd = accept(listen_fd, NULL, 0);
+	if (!ASSERT_OK_FD(server_fd, "accept"))
+		goto close_fds;
+
+	/* bound the wait, so a lost redirect fails instead of hanging */
+	{
+		struct timeval tv = { .tv_sec = 10 };
+
+		setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	}
+
+	map_fd = bpf_map__fd(skel->maps.sock_map);
+	err = bpf_map_update_elem(map_fd, &zero, &server_fd, BPF_NOEXIST);
+	if (!ASSERT_EQ(err, -EBUSY, "server should be allowed"))
+		goto close_fds;
+
+	err = bpf_map_update_elem(map_fd, &one, &client_fd, BPF_NOEXIST);
+	if (!ASSERT_OK(err, "client should be allowed"))
+		goto close_fds;
+
+	/* Phase 1: large transfer through the stream verdict ingress
+	 * redirect: client send -> server ingress via mptcp_read_skb
+	 */
+	skel->bss->redirect_idx = 0;
+	skel->bss->redirect_flags = BPF_F_INGRESS;
+
+	for (i = 0; i < sends; i++) {
+		*(size_t *)snd = i;
+
+		sent = send(client_fd, snd, send_len, 0);
+		if (!ASSERT_EQ(sent, send_len, "verdict:send"))
+			goto close_fds;
+	}
+
+	for (i = 0; i < sends; i++) {
+		size_t off = 0;
+
+		/* the redirect is asynchronous: the last skbs of a chunk can
+		 * still be in flight when recv() returns, so collect the
+		 * chunk piece by piece instead of relying on MSG_WAITALL
+		 */
+		while (off < send_len) {
+			recvd = recv(server_fd, rcv + off, send_len - off,
+				     MSG_WAITALL);
+			if (!ASSERT_GT(recvd, 0, "verdict:recv size"))
+				goto close_fds;
+			off += recvd;
+		}
+		if (!ASSERT_EQ(*(size_t *)rcv, i, "verdict:recv order"))
+			goto close_fds;
+		if (!ASSERT_MEMEQ(rcv + sizeof(i), snd + sizeof(i),
+				  send_len - sizeof(i), "verdict:recv data"))
+			goto close_fds;
+	}
+
+	skel->bss->redirect_flags = 0;
+
+	/* Phase 2: same amount through the sk_msg redirect, looping the
+	 * data back to the sender's own ingress queue
+	 */
+	msg_fd = bpf_program__fd(skel->progs.mptcp_sockmap_msg_verdict);
+	err = bpf_prog_attach(msg_fd, map_fd, BPF_SK_MSG_VERDICT, 0);
+	if (!ASSERT_OK(err, "msg verdict:attach"))
+		goto close_fds;
+
+	/* re-add the client so that the psock picks up the new verdicts */
+	bpf_map_delete_elem(map_fd, &one);
+	err = bpf_map_update_elem(map_fd, &one, &client_fd, BPF_ANY);
+	if (!ASSERT_OK(err, "msg verdict:re-add client_fd"))
+		goto msg_detach;
+
+	skel->bss->redirect_idx = 1;
+	skel->bss->redirect_flags = BPF_F_INGRESS;
+
+	for (i = 0; i < sends; i++) {
+		*(size_t *)snd = i;
+
+		sent = send(client_fd, snd, send_len, 0);
+		if (!ASSERT_EQ(sent, send_len, "msg:send"))
+			goto msg_detach;
+	}
+
+	for (i = 0; i < sends; i++) {
+		size_t off = 0;
+
+		while (off < send_len) {
+			recvd = recv(client_fd, rcv + off, send_len - off,
+				     MSG_WAITALL);
+			if (!ASSERT_GT(recvd, 0, "msg:recv size"))
+				goto msg_detach;
+			off += recvd;
+		}
+		if (!ASSERT_EQ(*(size_t *)rcv, i, "msg:recv order"))
+			goto msg_detach;
+		if (!ASSERT_MEMEQ(rcv + sizeof(i), snd + sizeof(i),
+				  send_len - sizeof(i), "msg:recv data"))
+			goto msg_detach;
+	}
+
+	skel->bss->redirect_flags = 0;
+
+msg_detach:
+	bpf_prog_detach2(msg_fd, map_fd, BPF_SK_MSG_VERDICT);
+close_fds:
+	close(client_fd);
+	close(server_fd);
+close_listen:
+	close(listen_fd);
+free_bufs:
+	free(snd);
+	free(rcv);
+}
+
 static void test_mptcp_sockmap(void)
 {
 	struct mptcp_sockmap *skel;
@@ -743,6 +897,7 @@ static void test_mptcp_sockmap(void)
 	test_sockmap_with_mptcp_fallback(skel);
 	test_sockmap_with_mptcp(skel);
 	test_sockmap_mptcp_support(skel);
+	test_sockmap_large(skel);
 
 close_netns:
 	netns_free(netns);
