@@ -4733,7 +4733,13 @@ static int __mptcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 	int copied = 0;
 	u32 offset;
 
+#ifdef CONFIG_LOCKDEP
+	/* __mptcp_read_sock() can be invoked from BH context via the TLS
+	 * strparser, so the plain msk_owned_by_me() assertion does not
+	 * hold there: accept either the socket lock or the slock.
+	 */
 	DEBUG_NET_WARN_ON_ONCE(!lockdep_sock_is_held(sk));
+#endif
 
 	if (sk->sk_state == TCP_LISTEN)
 		return -ENOTCONN;
