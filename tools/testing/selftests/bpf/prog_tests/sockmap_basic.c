@@ -78,7 +78,11 @@ static int connected_socket_v4_mptcp(void)
 		goto close_l;
 	}
 
-	close(l);
+	/* Keep the listener open on purpose: closing it would abort the
+	 * un-accepted connection, moving the client msk out of
+	 * TCP_ESTABLISHED, and sockmap updates on it would then fail
+	 * with -EOPNOTSUPP.
+	 */
 	return c;
 
 close_l:
